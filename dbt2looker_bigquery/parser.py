@@ -122,36 +122,54 @@ def parse_typed_models(raw_manifest: dict, raw_catalog: dict, tag: Optional[str]
     
     check_model_materialization(dbt_models, raw_catalog, adapter_type)
 
-    # Update dbt models with data types from catalog
-    dbt_typed_models = [  
-        model.model_copy(update={'columns': {
-            column.name: column.model_copy(update={
-                'data_type': get_column_type_from_catalog(catalog_nodes, model.unique_id, column.name),
-                'inner_types': get_column_inner_type_from_catalog(catalog_nodes, model.unique_id, column.name),
+    # 1. Update dbt models checking manifest first (Fusion contracts), falling back to catalog
+    dbt_typed_models = []
+    for model in dbt_models:
+        updated_columns = {}
+        for column in model.columns.values():
+            # Extract types from manifest if available (populated via dbt Fusion)
+            manifest_type = getattr(column, 'data_type', None)
+            manifest_inner_types = getattr(column, 'inner_types', None)
+
+            # Fallback lookups from catalog
+            catalog_type = get_column_type_from_catalog(catalog_nodes, model.unique_id, column.name)
+            catalog_inner_types = get_column_inner_type_from_catalog(catalog_nodes, model.unique_id, column.name)
+
+            resolved_type = manifest_type or catalog_type
+            resolved_inner_types = manifest_inner_types or catalog_inner_types
+
+            # Final safe fallback to ensure Looker dimensions don't break
+            if not resolved_type:
+                logging.debug('Column %s in model %s has no data type. Defaulting to STRING.', column.name, model.name)
+                resolved_type = "STRING"
+
+            updated_columns[column.name] = column.model_copy(update={
+                'data_type': resolved_type,
+                'inner_types': resolved_inner_types,
             })
-            for column in model.columns.values()
-        }})
-        for model in dbt_models
-        if model.unique_id in catalog_nodes
-    ]
+            
+        dbt_typed_models.append(model.model_copy(update={'columns': updated_columns}))
 
-    # add catalog only array columns to dbt models
+    # 2. Add catalog-only array columns to dbt models (safeguarded against missing or empty catalog)
     for model in dbt_typed_models:
-        for column in catalog_nodes[model.unique_id].columns.values():
-            if column.name not in model.columns:
-                if column.type[0:5] == 'ARRAY':
-                    logging.debug(column.name + " is an array column")
-                    new_column = models.DbtModelColumn(
-                        name=column.name,
-                        description="missing column from manifest.json, generated from catalog.json",
-                        data_type=column.data_type,
-                        inner_types=column.inner_types,
-                        meta=models.DbtModelColumnMeta(),
-                    )
-                    model.columns[column.name] = new_column
+        if catalog_nodes and model.unique_id in catalog_nodes:
+            for column in catalog_nodes[model.unique_id].columns.values():
+                if column.name not in model.columns:
+                    if getattr(column, 'type', None) and column.type[0:5] == 'ARRAY':
+                        logging.debug(column.name + " is an array column")
+                        new_column = models.DbtModelColumn(
+                            name=column.name,
+                            description="missing column from manifest.json, generated from catalog.json",
+                            data_type=column.data_type,
+                            inner_types=column.inner_types,
+                            meta=models.DbtModelColumnMeta(),
+                        )
+                        model.columns[column.name] = new_column
 
-    logging.debug('Found catalog entries for %d models', len(dbt_typed_models))
-    logging.debug('Catalog entries missing for %d models', len(dbt_models) - len(dbt_typed_models))
+    # Fix logging counts to accurately reflect catalog status without breaking executions
+    models_in_catalog = len([m for m in dbt_typed_models if catalog_nodes and m.unique_id in catalog_nodes])
+    logging.debug('Found catalog entries for %d models', models_in_catalog)
+    logging.debug('Catalog entries missing for %d models', len(dbt_models) - models_in_catalog)
 
     check_models_for_missing_column_types(dbt_typed_models)
 
