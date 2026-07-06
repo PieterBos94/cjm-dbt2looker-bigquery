@@ -138,10 +138,15 @@ def parse_typed_models(raw_manifest: dict, raw_catalog: dict, tag: Optional[str]
             resolved_type = manifest_type or catalog_type
             resolved_inner_types = manifest_inner_types or catalog_inner_types
 
-            # Final safe fallback to ensure Looker dimensions don't break
+            if resolved_type and isinstance(resolved_type, str):
+                resolved_type = resolved_type.upper()
+
             if not resolved_type:
-                logging.debug('Column %s in model %s has no data type. Defaulting to STRING.', column.name, model.name)
-                resolved_type = "STRING"
+                logging.error(
+                    f"CRITICAL: Column '{column.name}' in model '{model.name}' has no data type defined. "
+                    f"Please ensure 'data_type' is specified in your schema.yml or that model contracts are enabled."
+                )
+                raise ValueError(f"Missing data type for column '{column.name}' in model '{model.name}'.")
 
             updated_columns[column.name] = column.model_copy(update={
                 'data_type': resolved_type,
